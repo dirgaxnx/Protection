@@ -1,1 +1,102 @@
-[]
+#!/usr/bin/env bash
+set -euo pipefail
+
+# CONFIG: sesuaikan daftar file yang ingin dimasukkan ke manifest
+FILES_TO_INCLUDE=(
+  "index.js"
+  "config.json"
+  "lib/helpers.js"
+  "package-lock.json"
+)
+
+OUTFILE="${1:-Integrity-manifest.json}"   # default output file
+AUTHOR="${AUTHOR:-ci-bot}"
+VERSION="${VERSION:-1.0}"
+GEN_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# helper: compute sha256 in format sha256:<hex>
+sha256_of_file() {
+  local f="$1"
+  if [ ! -f "$f" ]; then
+    echo ""
+    return 1
+  fi
+  # use sha256sum (Linux) or shasum (mac)
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$f" | awk '{print "sha256:" $1}'
+  else
+    shasum -a 256 "$f" | awk '{print "sha256:" $1}'
+  fi
+}
+
+# Build JSON files map
+declare -A FILEMAP
+for f in "${FILES_TO_INCLUDE[@]}"; do
+  if [ -f "$f" ]; then
+    digest="$(sha256_of_file "$f")" || digest=""
+    if [ -z "$digest" ]; then
+      echo "⚠️  file not found or cannot hash: $f" >&2
+    fi
+    FILEMAP["$f"]="$digest"
+  else
+    echo "⚠️  file not found (skipping): $f" >&2
+    FILEMAP["$f"]=""
+  fi
+done
+
+# detection rules template (you can edit/change before commit)
+read -r -d '' DETECTION_JSON <<'EOF'
+{
+  "forbidden_patterns": [
+    { "id": "eval_usage", "description": "use of eval or new Function", "regex": "(?:\\beval\\s*\\(|\\bnew\\s+Function\\s*\\()" },
+    { "id": "token_env_access", "description": "direct BOT_TOKEN env access", "regex": "process\\.env\\s*\\[?['\\\"]?BOT_TOKEN['\\\"]?\\]?" },
+    { "id": "dynamic_require_url", "description": "require from remote URL", "regex": "require\\(\\s*['\\\"]https?:\\/\\/" }
+  ],
+  "blacklisted_packages": [
+    { "name": "evil-socket", "reason": "known exfiltration library" }
+  ]
+}
+EOF
+
+# Start writing manifest JSON (without signature)
+tmp="$(mktemp)"
+echo "{" > "$tmp"
+echo "  \"version\": \"${VERSION}\"," >> "$tmp"
+echo "  \"generatedAt\": \"${GEN_TS}\"," >> "$tmp"
+echo "  \"author\": \"${AUTHOR}\"," >> "$tmp"
+echo "  \"files\": {" >> "$tmp"
+
+first=true
+for key in "${!FILEMAP[@]}"; do
+  val="${FILEMAP[$key]}"
+  # write pair (with empty string if missing)
+  if [ "$first" = true ]; then
+    first=false
+  else
+    echo "," >> "$tmp"
+  fi
+  # JSON-escape the key (basic)
+  esc_key=$(printf '%s' "$key" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()))')
+  printf '    %s: %s' "$esc_key" "$(printf '%s' "$val" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()))')" >> "$tmp"
+done
+
+echo "" >> "$tmp"
+echo "  }," >> "$tmp"
+
+# attach detection rules
+echo "  \"detection_rules\": $DETECTION_JSON," >> "$tmp"
+
+# policy template
+cat >> "$tmp" <<'JSON'
+  "policy": {
+    "fail_action": "alert_and_quarantine",
+    "alert_webhook": "",
+    "auto_block_threshold": 3
+  }
+}
+JSON
+
+mv "$tmp" "$OUTFILE"
+chmod 644 "$OUTFILE"
+echo "✅ Manifest written to $OUTFILE"
+echo " - Edit $OUTFILE to add 'public_key' and set 'alert_webhook' if needed."
